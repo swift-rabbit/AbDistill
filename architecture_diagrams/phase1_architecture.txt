@@ -1,0 +1,231 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PHASE 1 — DATASET CONSTRUCTION
+  (generate_antifold.py  →  generate_random_dataset.py  →  generate_boltz.py
+   →  score_smina.py  →  aggregate_results.py  →  prepare_dataset.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+══════════════════════════════════════════════════════════════════
+  STEP 1A — AntiFold Sequence Generation  (generate_antifold.py)
+══════════════════════════════════════════════════════════════════
+
+1i9j_imgt.pdb  (IMGT-numbered scaffold, chains H / L)
+    │
+    ▼
+AntiFold  --regions CDRH3  --heavy_chain H  --light_chain L
+    │
+    ├─ Temperature 0.5   → seqs_per_temp × 1.5 candidates sampled
+    ├─ Temperature 1.0   → seqs_per_temp × 1.5 candidates sampled
+    ├─ Temperature 1.5   → seqs_per_temp × 1.5 candidates sampled
+    └─ Fallback T=1.2    → only used if quota not yet met
+    │
+    │  For each sampled FASTA:
+    │    · Parse Heavy / Light from '/' separator in AntiFold output
+    │    · Skip wildtype sequences (WT / WILD in header)
+    │    · Deduplicate by heavy_sequence identity
+    │    · Assign id = "seq_{n}_T{temp}"
+    │
+    ▼
+antifold_out/antifold_probabilities.csv   ← per-position AA log-probs (kept for Phase 3)
+initial_dataset_{N}.csv
+    id | heavy_sequence | light_sequence
+
+
+══════════════════════════════════════════════════════════════════
+  STEP 1B — Random Baseline Generation  (generate_random_dataset.py)
+══════════════════════════════════════════════════════════════════
+
+Fixed 1I9J backbone (hardcoded):
+    HEAVY_PREFIX  =  "EVKLVES...YYC"   (N-terminal framework + CDR-H1/H2)
+    HEAVY_SUFFIX  =  "WGQGTLVTVSA"     (C-terminal framework)
+    LIGHT_SEQUENCE = "DVVVTQ...LEIK"   (full fixed VL)
+    │
+    For each of N sequences:
+    │
+    ├─ random_loop = random.choice(AMINO_ACIDS) × 12   (pure random CDR-H3)
+    └─ heavy_seq   = HEAVY_PREFIX + random_loop + HEAVY_SUFFIX
+    │
+    ▼
+random_dataset_{N}.csv
+    id | heavy_sequence | light_sequence
+    ("random_0", "random_1", ...)
+
+Purpose: provide structurally implausible negatives to prevent the model
+         from collapsing to a trivial solution on framework-only variation.
+
+
+══════════════════════════════════════════════════════════════════
+  STEP 1C — Boltz-2 Structure Prediction  (generate_boltz.py)
+══════════════════════════════════════════════════════════════════
+
+For each (seq_id, heavy_sequence, light_sequence) row in CSV:
+    │
+    ├─ If boltz_results_{seq_id}/predictions/{seq_id}/affinity_{seq_id}.json
+    │  already exists and is non-empty → SKIP  (incremental)
+    │
+    ├─ Write YAML input:
+    │      sequences:
+    │        - protein: {id: "A", sequence: <heavy>, msa: "empty"}
+    │        - protein: {id: "B", sequence: <light>, msa: "empty"}
+    │        - ligand:  {id: "C", smiles: "<testosterone>"}
+    │      properties:
+    │        - affinity: {binder: "C"}
+    │
+    ├─ Run: boltz predict <yaml>
+    │       --out_dir boltz_out/
+    │       --output_format pdb
+    │       --diffusion_samples 1
+    │       CUDA_VISIBLE_DEVICES={worker_id % num_gpus}
+    │       BOLTZ_CACHE=boltz_weights/
+    │
+    └─ Parallelism: num_gpus × concurrent_per_gpu ThreadPool workers
+                    (default: 2 GPUs × 4 workers = 8 concurrent)
+    │
+    ▼
+boltz_out/boltz_results_{seq_id}/predictions/{seq_id}/
+    ├─ {seq_id}_model_0.pdb                ← predicted complex (chains A, B, C)
+    ├─ plddt_{seq_id}_model_0.npz          ← per-token pLDDT  [N_p + N_lig]
+    ├─ pae_{seq_id}_model_0.npz            ← PAE matrix       [N_p+N_lig, N_p+N_lig]
+    ├─ pde_{seq_id}_model_0.npz            ← PDE matrix       [N_p+N_lig, N_p+N_lig]
+    ├─ affinity_{seq_id}.json              ← {affinity_pred_value,
+    │                                          affinity_pred_value1,
+    │                                          affinity_pred_value2}
+    └─ confidence_{seq_id}_model_0.json    ← {ligand_iptm, iptm, ptm, ...}
+
+
+══════════════════════════════════════════════════════════════════
+  STEP 1D — SMINA Vinardo Docking Score  (score_smina.py)
+══════════════════════════════════════════════════════════════════
+
+For each boltz_results_{seq_id}/ directory:
+    │
+    ├─ If smina_affinity_{seq_id}.json exists → SKIP  (incremental)
+    │
+    ├─ Read {seq_id}_model_0.pdb
+    │
+    ├─ Split PDB into:
+    │    receptor.pdb = ATOM lines where chain ∈ {A, B}   (antibody Fv)
+    │    ligand.pdb   = HETATM lines where chain = C       (testosterone)
+    │
+    ├─ Run: smina  --receptor receptor.pdb
+    │              --ligand   ligand.pdb
+    │              --score_only
+    │              --scoring vinardo
+    │
+    ├─ Parse stdout: "Affinity: <value> (kcal/mol)"
+    │                lower (more negative) = stronger predicted binder
+    │
+    └─ Workers: parallel (default 8 workers)
+    │
+    ▼
+boltz_out/boltz_results_{seq_id}/predictions/{seq_id}/
+    └─ smina_affinity_{seq_id}.json    ← {smina_vinardo_affinity: <float>}
+
+
+══════════════════════════════════════════════════════════════════
+  STEP 1E — Aggregate All Results  (aggregate_results.py)
+══════════════════════════════════════════════════════════════════
+
+Inputs:
+    initial_dataset_{N}.csv     (AntiFold sequences — required)
+    random_dataset_{N}.csv      (random sequences   — optional)
+    boltz_out/boltz_results_*/  (all prediction folders)
+    │
+    ├─ Build seq_lookup: {id → (heavy_sequence, light_sequence)}
+    │  from the concatenated sequence CSVs
+    │
+    ├─ For each boltz_results_{seq_id}/ folder:
+    │
+    │    affinity_{seq_id}.json
+    │      → boltz_affinity_pred_value
+    │      → boltz_affinity_pred_value1
+    │      → boltz_affinity_pred_value2
+    │
+    │    smina_affinity_{seq_id}.json
+    │      → smina_vinardo_affinity
+    │
+    │    confidence_{seq_id}_model_0.json
+    │      → boltz_conf_ligand_iptm
+    │      → boltz_conf_iptm
+    │      → boltz_conf_ptm
+    │      → (all other confidence keys prefixed with boltz_conf_)
+    │
+    └─ Rows missing any JSON file are included with NaN values
+    │
+    ▼
+final_master_dataset.csv
+    id | heavy_sequence | light_sequence
+    | smina_vinardo_affinity
+    | boltz_affinity_pred_value  boltz_affinity_pred_value1  boltz_affinity_pred_value2
+    | boltz_conf_ligand_iptm  boltz_conf_iptm  boltz_conf_ptm  ...
+
+
+══════════════════════════════════════════════════════════════════
+  STEP 1F — Weights & Cluster-Based Splits  (prepare_dataset.py)
+══════════════════════════════════════════════════════════════════
+
+final_master_dataset.csv
+    │
+    ├─ Compute derived columns:
+    │    ranking_weight = ligand_iptm²  /  (1 + |pred_value1 − pred_value2|)
+    │    latent_weight  = same formula
+    │    (high iptm = confident pose; low disagreement = consistent affinity)
+    │
+    ├─ Drop rows missing any of:
+    │    smina_vinardo_affinity, boltz_affinity_pred_value,
+    │    boltz_conf_ligand_iptm, heavy_sequence, light_sequence
+    │
+    ├─ Cluster sequences to prevent leakage
+    │    heavy_sequence → integer char array  [N, L]
+    │    pairwise Hamming distances  (scipy pdist)
+    │    adj_matrix: sequences with Hamming ≤ 2 are connected
+    │    connected_components (scipy sparse)  →  cluster labels
+    │
+    ├─ Stratified split (preserves top-1% binders in every partition):
+    │
+    │    Classify clusters:
+    │      enriched = clusters containing ≥1 top-1% SMINA binder
+    │      plain    = all other clusters
+    │
+    │    Split enriched clusters by CLUSTER COUNT   (70 / 15 / 15 %)
+    │    Split plain clusters by ROW COUNT          (70 / 15 / 15 %)
+    │    (two different strategies to avoid scarcity of strong binders in val/test)
+    │
+    │    Merge → train / val / test index sets
+    │
+    └─ Sanity check: print top-1% prevalence in each split
+    │
+    ▼
+train_set.csv   (~70 %)   ← training data for teacher and student
+val_set.csv     (~15 %)   ← used for checkpoint selection during training
+test_set.csv    (~15 %)   ← held-out; only for final evaluate.py run
+    (all three contain: id, heavy_sequence, light_sequence, smina_vinardo_affinity,
+     boltz_affinity_pred_value, boltz_conf_ligand_iptm, ranking_weight, latent_weight, ...)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PHASE 1 DATA FLOW SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1i9j_imgt.pdb
+       │ generate_antifold.py
+       ▼
+  initial_dataset_{N}.csv ──┐
+  random_dataset_{N}.csv  ──┤
+                             │ generate_boltz.py
+                             ▼
+                      boltz_out/boltz_results_*/
+                             │
+                   ┌─────────┴──────────┐
+          score_smina.py          (already in boltz output)
+                   │                    │
+          smina_affinity_*.json   affinity_*.json
+                                  confidence_*.json
+                             │
+                      aggregate_results.py
+                             │
+                      final_master_dataset.csv
+                             │
+                       prepare_dataset.py
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+        train_set.csv   val_set.csv   test_set.csv

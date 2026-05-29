@@ -1,0 +1,271 @@
+# -*- coding: utf-8 -*-
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PHASE 3 — EVOLUTIONARY OPTIMISATION
+  (evolve.py  →  generate_top_ga_seq.py  →  [optional: generate_boltz.py])
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+══════════════════════════════════════════════════════════════════
+  STEP 3A — Load Baseline & Identify CDR-H3  (evolve.py)
+══════════════════════════════════════════════════════════════════
+
+Option A: from CSV (default)
+    final_master_dataset.csv
+        │
+        ├─ Best row = df.loc[df['smina_vinardo_affinity'].idxmin()]
+        │    → baseline_heavy, baseline_light
+        │
+        └─ CDR-H3 auto-detection (if --cdr_start / --cdr_end not given):
+             chars = np.array([list(s) for s in df['heavy_sequence']])
+             varying_positions = positions where chars vary across all seqs
+             cdr_start = varying_positions[0]
+             cdr_end   = varying_positions[-1] + 1
+             (fallback: cdr_start=95, cdr_end=105 if no variation found)
+
+Option B: from custom FASTA (--baseline_fasta)
+    ga_baseline.fasta
+        │
+        ├─ Parse headers: match 'heavy'/'h' and 'light'/'l'
+        └─ --cdr_start and --cdr_end REQUIRED (no auto-detection)
+
+
+══════════════════════════════════════════════════════════════════
+  STEP 3B — Load AntiFold PSSM  (evolve.py)
+══════════════════════════════════════════════════════════════════
+
+antifold_out/antifold_probabilities.csv   (from Phase 1, Step 1A)
+    │
+    ├─ Filter rows where pdb_chain == 'H'   (Heavy chain only)
+    │
+    ├─ Build position-indexed lookup list:
+    │    pssm[i] = {AA: log_prob}   for each heavy position i
+    │              (20 amino acids per position)
+    │
+    └─ Used during evaluation to penalise structurally unlikely loops
+    │
+    ▼
+pssm  (list of dicts, length = len(heavy_chain))
+
+
+══════════════════════════════════════════════════════════════════
+  STEP 3C — Deep Mutational Scan (DMS) Seed  (evolve.py)
+══════════════════════════════════════════════════════════════════
+
+baseline_heavy   (from Step 3A)
+    │
+    ├─ Generate all single-point mutations in CDR-H3 range:
+    │    For each position p in [cdr_start, cdr_end):
+    │      For each AA in AMINO_ACIDS (20 AAs):
+    │        If AA != baseline_heavy[p]:
+    │          mutant = baseline_heavy with position p replaced
+    │
+    │    Total DMS pool = (cdr_end - cdr_start) × 19  +  1 wildtype
+    │    e.g. 12-residue CDR-H3 → 12 × 19 + 1 = 229 variants
+    │
+    └─ Wildtype is prepended to DMS pool
+    │
+    ▼
+dms_seqs  (list of heavy sequences, length ≈ N_CDR × 19 + 1)
+
+
+══════════════════════════════════════════════════════════════════
+  STEP 3D — Evaluate Batch  (evolve.py)
+══════════════════════════════════════════════════════════════════
+
+population_heavy  (list of heavy sequences to score)
+    │
+    ├─ [1] Student Model Inference  (batches of 128)
+    │
+    │    For each batch:
+    │      paired_seqs = [f"{heavy}|{baseline_light}" for heavy in batch]
+    │      _, pred_affinity, pred_boltz, _ = student_model(paired_seqs)
+    │
+    │    → aff   [N]   ← pred_affinity  (lower = stronger predicted binder)
+    │    → boltz [N]   ← pred_boltz     (predicted ΔG)
+    │
+    ├─ [2] AntiFold PSSM Scoring  (per sequence)
+    │
+    │    For each heavy sequence:
+    │      For each position i in [cdr_start, cdr_end):
+    │        log_p = pssm[i][seq[i]]
+    │        nll   = -log_p
+    │      avg_nll  = mean(nlls over CDR positions)
+    │      avg_prob = exp(-avg_nll)    ← 0.0–1.0 foldability score
+    │
+    │    → antifold_probs [N]   (higher = structurally more plausible)
+    │
+    └─ [3] Multiplicative Fitness  (Gatekeeper Strategy)
+    │
+    │    aff_reward = max(0.001, aff + 3.0)   ← shift to positive scale;
+    │                                             floor at 0.001 prevents
+    │                                             out-of-distribution collapse
+    │    fitness = aff_reward × antifold_prob
+    │              ↑ tighter binding   ↑ structurally plausible
+    │
+    ▼
+fitness [N],  aff [N],  boltz [N],  antifold_probs [N]
+
+
+══════════════════════════════════════════════════════════════════
+  STEP 3E — AdaLead Board & Directed Evolution  (evolve.py)
+══════════════════════════════════════════════════════════════════
+
+INITIALISATION:
+    DMS pool (Step 3C) → evaluate_batch (Step 3D) → seed AdaLeadBoard
+
+AdaLeadBoard (max_size = board_size, default 500):
+    board = {heavy_seq → {fitness, aff, boltz, antifold}}
+    After each add():
+      Sort all entries by fitness descending
+      Retain only top board_size sequences
+
+EVOLUTION LOOP  (default: 30 generations):
+
+    For gen in range(generations):
+        │
+        ├─ [Recombination]  mutate_and_recombine(board_seqs, ...)
+        │
+        │    Generate num_mutants new sequences (default 200):
+        │
+        │    Repeat until |mutants| == num_mutants (max attempts × 5):
+        │
+        │      Parent sampling (linear bias, top → bottom):
+        │        p1 ~ Categorical(weights = linspace(1.0, 0.1, board_size))
+        │        p2 ~ Categorical(weights = linspace(1.0, 0.1, board_size))
+        │
+        │      Crossover (per CDR position):
+        │        child[i] = p1[i]  or  p2[i]   with prob 0.5 each
+        │
+        │      Point mutation (per CDR position):
+        │        With prob mutation_rate (default 0.10):
+        │          child[i] = random.choice(AMINO_ACIDS)
+        │
+        │    → new_variants  (list of unique heavy sequences)
+        │
+        ├─ [Evaluation]  evaluate_batch(new_variants, ...)
+        │    → fitness, aff, boltz, antifold_probs
+        │
+        └─ [Update board]  board.add(new_variants, ...)
+             Merges new entries; trims to top board_size by fitness
+             Duplicate heavy sequences NOT added again
+             │
+             Print: Gen | Max Fit | Best Aff | Best AntiFold
+    │
+    ▼
+board.board  (top board_size sequences with full stats)
+
+
+══════════════════════════════════════════════════════════════════
+  STEP 3F — Save Evolution Results  (evolve.py)
+══════════════════════════════════════════════════════════════════
+
+board.board
+    │
+    ├─ Flatten to list of dicts:
+    │    heavy_sequence, light_sequence  (= baseline_light, fixed)
+    │    fitness_score
+    │    pred_smina_rank      ← pred_affinity from student model
+    │    pred_boltz_delta_g   ← pred_boltz from student model
+    │    antifold_prob
+    │
+    ▼
+evolved_candidates.csv
+    heavy_sequence | light_sequence | fitness_score
+    | pred_smina_rank | pred_boltz_delta_g | antifold_prob
+    (up to board_size rows, sorted by fitness descending)
+
+
+══════════════════════════════════════════════════════════════════
+  STEP 3G — Extract Top Candidates  (generate_top_ga_seq.py)
+══════════════════════════════════════════════════════════════════
+
+evolved_candidates.csv
+    │
+    ├─ Sort by fitness_score descending
+    ├─ Take top top_k rows  (default 100)
+    ├─ Reset index
+    │
+    ├─ Add id column:  "ev_rank_1", "ev_rank_2", ..., "ev_rank_K"
+    │
+    └─ Reorder columns:
+         id | heavy_sequence | light_sequence | fitness_score
+         | pred_smina_rank | antifold_prob
+    │
+    ▼
+top_ga_sequences.csv
+    (compatible with generate_boltz.py for optional Boltz-2 validation)
+
+
+══════════════════════════════════════════════════════════════════
+  STEP 3H — [Optional] Boltz-2 Structural Validation
+══════════════════════════════════════════════════════════════════
+
+top_ga_sequences.csv
+    │
+    └─ Feed into generate_boltz.py  (same pipeline as Phase 1 Step 1C)
+         → boltz_out/boltz_results_ev_rank_{k}/
+              ev_rank_{k}_model_0.pdb
+              affinity_ev_rank_{k}.json
+              confidence_ev_rank_{k}_model_0.json
+         → score_smina.py  → smina_affinity_ev_rank_{k}.json
+         → aggregate_results.py  → final validation CSV
+
+    Purpose: confirm the top evolutionary candidates with physics-based
+             docking (SMINA Vinardo) on freshly predicted structures,
+             closing the loop back to the ground-truth scoring used
+             to train the teacher model.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PHASE 3 DATA FLOW SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  INPUTS
+  ──────
+  final_master_dataset.csv          ← Phase 1 output (best binder = baseline)
+  antifold_out/antifold_probabilities.csv  ← Phase 1 AntiFold PSSM
+  best_student_model_spearman.pt    ← Phase 2 trained student model
+
+  EVOLUTION LOOP
+  ──────────────
+  load_baseline()
+       │
+       ├─ baseline_heavy, baseline_light, cdr_start, cdr_end
+       │
+  load_antifold_pssm()
+       │
+       ├─ pssm[pos][AA] = log_prob
+       │
+  generate_dms(baseline_heavy)
+       │  (N_CDR × 19 + 1 variants)
+       ▼
+  evaluate_batch()
+       │  student: pred_affinity, pred_boltz
+       │  antifold: avg_prob over CDR positions
+       │  fitness  = max(0.001, aff+3.0) × antifold_prob
+       ▼
+  AdaLeadBoard.add()   ← seed with DMS results
+       │
+       │  For each generation:
+       │    ┌──────────────────────────────────┐
+       │    │  mutate_and_recombine(board_seqs) │
+       │    │    linear-biased parent sampling  │
+       │    │    crossover + point mutation     │
+       │    └──────────────┬───────────────────┘
+       │                   │
+       │              evaluate_batch()
+       │                   │
+       │              board.add()  → retain top board_size
+       └───────────────────┘
+       │
+       ▼
+  evolved_candidates.csv
+       │
+  generate_top_ga_seq.py
+       │  sort by fitness, take top-K, assign ev_rank_* IDs
+       ▼
+  top_ga_sequences.csv
+
+  [Optional validation]
+  top_ga_sequences.csv  →  generate_boltz.py  →  score_smina.py
+                        →  aggregate_results.py  →  final validation CSV

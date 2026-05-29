@@ -1,0 +1,175 @@
+PHASE 2 ARCHITECTURE
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+(precompute_features.py — runs once, outputs cached to .npz)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Backbone coords (N, Cα, C) of N_p residues
+    → ESM-IF1 (eval, no_grad)    → [N_p, 512]   saved: pocket
+
+Ligand heavy atom coords (21 atoms)
+    → UniMol2  (eval, no_grad)   → [21,  768]   saved: ligand
+
+Boltz-2 output files parsed:
+    plddt_{id}.npz  → plddt_full [N_p + 21]     saved: plddt  (combined)
+    pae_{id}.npz    → pae_full   sliced:
+                          pae_p2l  [N_p, 21]    saved: pae_p2l
+                          pae_l2p  [21,  N_p]   saved: pae_l2p
+                          pae_to_lig [N_p]       saved: pae_to_lig
+                                   = pae_p2l.mean(axis=1)
+    pde_{id}.npz    → pde_full   sliced:
+                          pde_p2l  [N_p, 21]    saved: pde_p2l
+                          pde_l2p  [21,  N_p]   saved: pde_l2p
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+(train_teacher.py — TeacherModel forward pass)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{seq_id}.npz loaded by DataLoader
+    │
+    ├─ h_p  [B, N_p, 512]    (ESM-IF1 pocket embeddings)
+    │         proj_p( h_p
+    │               + plddt_mlp_p(p_plddt)    Linear(1→256)→GELU→Linear(256→512)
+    │               + pae_lig_mlp(pae_to_lig) Linear(1→256)→GELU→Linear(256→512) )
+    │         → Linear(512→256)               → [B, N_p, 256]
+    │
+    └─ h_l  [B, 21, 768]     (UniMol2 ligand embeddings)
+              proj_l( h_l
+                    + plddt_mlp_l(l_plddt)    Linear(1→256)→GELU→Linear(256→768) )
+              → Linear(768→256)               → [B, 21, 256]
+                        │
+                        ▼
+    BindNet — 3 × BindNetLayer  (num_heads=4)
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  Each layer (k = 1, 2, 3):                                          │
+    │                                                                     │
+    │  Step 1 — Ligand (Q) → Pocket (K, V)                                │
+    │    q = LayerNorm(h_l),  kv = LayerNorm(h_p)                         │
+    │    attn_bias[j,i] = pae_w_l2p · PAE_l2p[j,i]                        │
+    │                   + pde_w_l2p · PDE_l2p[j,i]   ← separate scalars   │
+    │    attn_out, attn_weights = MHA(q, kv, kv, mask=attn_bias)          │
+    │    h_l = h_l + attn_out                          (residual)         │
+    │    h_l = h_l + ff_l(LayerNorm(h_l))              (FFN: 256→1024→256)│
+    │    → updated h_l  [B, 21, 256]                                      │
+    │                                                                     │
+    │  Step 2 — Pocket (Q) → Ligand (K, V)                                │
+    │    q = LayerNorm(h_p),  kv = LayerNorm(h_l)                         │
+    │    attn_bias[i,j] = pae_w_p2l · PAE_p2l[i,j]                        │
+    │                   + pde_w_p2l · PDE_p2l[i,j]   ← separate scalars   │
+    │    attn_out_p = MHA(q, kv, kv, mask=attn_bias)                      │
+    │    h_p = h_p + attn_out_p                        (residual)         │
+    │    h_p = h_p + ff_p(LayerNorm(h_p))              (FFN: 256→1024→256)│
+    │    → updated h_p  [B, N_p, 256]                                     │
+    │                                                                     │
+    │  attn_weights from Step 1 of layer 3 carried forward to pooling     │
+    └─────────────────────────────────────────────────────────────────────┘
+                        │
+      Pooling (after layer 3):
+      · ligand:  h_l.mean(dim=1)                           → [B, 256]
+      · protein: attn_weights shape [B, N_l, N_p]
+                 .sum(dim=1)  ← sum over 21 ligand queries → [B, N_p]
+                 softmax → weighted sum of h_p             → [B, 256]
+                        │
+                concat  → [B, 512]
+                        │
+         Linear(512→256) → LayerNorm(256) → GELU → Linear(256→256)
+                        │
+             256-D complex_embed        ← saved to teacher_embeddings.npy
+                        │                  (by precompute_teacher.py)
+                        ▼
+          Linear(256→64) → LayerNorm(64) → GELU → Dropout(0.1) → Linear(64→1)
+                        │
+              score [B, 1]
+                        │
+     Loss: asymmetric_list_mle_loss(score, smina_vinardo, ranking_weight,
+                                    fn_penalty=2.0)
+     Total Teacher Loss = L_rank   (only loss)
+                        │
+     Checkpoints: best_teacher.pt        (best EEF@5%)
+                  best_teacher_spearman.pt (best Spearman ρ)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  DISTILLATION BRIDGE
+  (precompute_teacher.py — teacher frozen, outputs pre-computed)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  teacher_embeddings.npy   [N_samples, 256]
+  teacher_embedding_index.json  {seq_id → row index}
+  → loaded by AbLigDataset; NOT fed into StudentModel.forward()
+    (looked up by seq_id, passed as regression target only)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ONLINE  (train.py — StudentModel forward pass)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"EVQLVQ...LTVY|DIQMT...LEIL"   (Heavy|Light concatenated, sep='|')
+                │
+    StudentProteinEncoder
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  AbLang2 "ablang2-paired"                                        │
+    │  · Input: list of [VH, VL] pairs                                 │
+    │  · mode='rescoding' → per-residue embeddings                     │
+    │  · Output dim: 480 (detected at init via dummy forward)          │
+    │  · Staged unfreezing across training:                            │
+    │      Ep  0– 5 : backbone frozen,  heads LR 1e-3 → 1e-4           │
+    │      Ep  6–15 : blocks 10–11 only, all LR 1e-4 → 1e-5            │
+    │      Ep 16–39 : full backbone,    all LR 1e-5 → 1e-6             │
+    │  Linear(480→256)       → h  [B, L, 256]                          │
+    │  pad_sequence          → prot_pad_mask  [B, L]                   │
+    │  n_heavy_list          → [len(VH) for each sample]               │
+    └──────────────────────────────────────────────────────────────────┘
+                │
+                │   h [B, L, 256],  prot_pad_mask,  n_heavy_list
+                │
+    CDRPositionEncoding
+    · IMGT CDR intervals (Heavy + Light): H1 27-38, H2 56-65, H3 105-117
+                                          L1 27-38, L2 56-65, L3 105-117
+    · Adds learned bias vector (dim=256) to CDR-position tokens
+    · Sharpens cross-attention onto paratope without hard masking
+                │
+    MockLigandEncoder
+    · nn.Parameter: 10 learned tokens  [1, 10, 256]
+    · .expand(B, -1, -1)               → [B, 10, 256]
+    · Static across all samples (testosterone is fixed molecule)
+                │
+    FullCrossAttention  (ligand Q → protein K, V)
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  cdr_encoder applied to prot_features first (CDR bias injected) │
+    │  MHA(query=lig [B,10,256], key=prot [B,L,256], value=prot)      │
+    │    key_padding_mask = ~prot_pad_mask  (ignore padding)          │
+    │  lig_out = LayerNorm(lig + attended)  [B, 10, 256]              │
+    │  complex_embed = lig_out.mean(dim=1)  [B, 256]                  │
+    └─────────────────────────────────────────────────────────────────┘
+                │
+     complex_embed [B, 256]
+                │
+    ┌───────────┬──────────────┬─────────────┬
+    ▼           ▼              ▼             ▼
+  Head 1      Head 2         Head 3        Head 4
+  Distill     Affinity Rank  Boltz Reg.    Pose Quality
+  ─────────── ───────────── ────────────  ────────────
+  Lin(256→256) Lin(256→64)  Lin(256→64)   Lin(256→64)
+  LN(256)      LN(64)       LN(64)        LN(64)
+  GELU         GELU         GELU          GELU
+  Drop(0.1)    Drop(0.1)    Drop(0.1)     Drop(0.1)
+  Lin(256→256) Lin(64→1)    Lin(64→1)     Lin(64→1)
+  [B, 256]     [B]          [B]           [B, 1]
+      │            │              │              │
+      │  target:   ▼              ▼              ▼
+      │  teacher_embeddings.npy   boltz_affinity BCE
+      │  (per-sample lookup)      _pred_value    vs ligand_iptm
+      ▼            ▼              ▼              > 0.75 threshold
+  distill_mse  asym_list_mle  boltz_mse     pose_quality_bce
+  ×dist_weight ×rank_weight   ×dist_weight
+  λ = 1.0      λ = 1.0        λ = 0.5       λ = 0.1
+      │            │              │              │
+      └────────────┴──────────────┴──────────────┘
+                        │
+   Total Loss = 1.0·L_dist + 1.0·L_rank + 0.5·L_boltz + 0.1·L_aux
+                        │
+         Mixed-precision backward (FP16 autocast + GradScaler)
+         grad clip max_norm=1.0
+         AdamW, CosineAnnealingLR (phase-reset at ep 6 and 16)
+                        │
+  Checkpoints: best_student_model.pt         (best EEF@5%)
+               best_student_model_spearman.pt (best Spearman ρ)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
