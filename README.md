@@ -1,10 +1,10 @@
 # AbDistill
 
-**Structure-Guided Knowledge Distillation for Antibody–Ligand Binding Prediction**
+**Cross-Modal Geometric Supervision for Antibody–Ligand Binding Prediction**
 
-> **TL;DR:** AbDistill lets you screen millions of antibody sequences in seconds by learning to mimic a slow, 3D structure-aware model from raw sequence alone. This repository provides the complete framework to reproduce the pipeline on custom datasets.
+> **TL;DR:** AbDistill lets you screen millions of antibody sequences in seconds by training a fast sequence-only neural surrogate supervised by 3D structural geometry. This repository provides the complete framework to reproduce the pipeline on custom datasets.
 
-AbDistill trains a fast, sequence-only antibody binding predictor by distilling 3D structural knowledge from a structure-aware teacher model. The teacher (BindNet) reads Boltz-2 predicted structures and encodes binding geometry via PAE/PDE-biased cross-attention; the student (AbLang2 + CDR cross-attention) learns to reproduce that geometric understanding from raw Heavy|Light sequence alone. At inference time the student runs in milliseconds with no structure prediction required.
+AbDistill trains a fast, sequence-only antibody binding predictor by encoding 3D structural priors from a structure-aware interaction model into a 1D sequence surrogate. The 3D model (BindNet) reads Boltz-2 predicted structures and encodes binding geometry via PAE/PDE-biased cross-attention; the sequence surrogate (AbLang2 + CDR cross-attention) learns to internalize that geometric understanding from raw Heavy|Light sequence alone. At inference time, the sequence model runs in milliseconds with no structure prediction required.
 
 The current target ligand is **testosterone** — all models and cached features are specific to this molecule, but the pipeline generalises to any fixed small-molecule target by rerunning from Phase 1.
 
@@ -27,7 +27,7 @@ AbDistill/
 │   ├── precompute_features.py    # Phase 2 — ESM-IF1 + UniMol2 + Boltz-2 features
 │   ├── train_teacher.py          # Phase 2 — BindNet teacher training
 │   ├── precompute_teacher.py     # Phase 2 — freeze teacher, cache 256-D embeddings
-│   ├── train.py                  # Phase 2 — student distillation training
+│   ├── train.py                  # Phase 2 — sequence surrogate training
 │   ├── evaluate.py               # Phase 2 — test-set evaluation (teacher or student)
 │   ├── evolve.py                 # Phase 3 — AdaLead CDR-H3 evolutionary search
 │   └── generate_top_ga_seq.py    # Phase 3 — extract top candidates from GA run
@@ -129,15 +129,15 @@ Adds two derived columns:
 | Column | Formula | Used for |
 |--------|---------|----------|
 | `ranking_weight` | `ligand_iptm² / (1 + \|pred1 − pred2\|)` | ListMLE and Boltz loss weighting |
-| `latent_weight` | same | Distillation and Boltz loss weighting |
+| `latent_weight` | same | Geometric alignment and Boltz loss weighting |
 
 Splits are **cluster-based**: sequences with Hamming distance ≤ 2 are kept in the same split, preventing sequence-level leakage. Default ratio: 70 / 15 / 15 %.
 
 ---
 
-### Phase 2 — Teacher–Student Distillation
+### Phase 2 — Cross-Modal Geometric Supervision & Sequence Surrogate Training
 
-**Goal:** Train a structure-aware teacher, distil its geometric knowledge into a fast sequence-only student.
+**Goal:** Train a structure-aware 3D interaction model, and encode its geometric priors into a fast sequence-only surrogate model.
 
 #### 2a. Precompute structural features
 
@@ -206,9 +206,9 @@ python scripts/precompute_teacher.py \
     --out_idx teacher_embedding_index.json
 ```
 
-Runs the frozen trained teacher on every sample and saves the 256-D `complex_embed` vectors to `teacher_embeddings.npy` with a `{seq_id → row_index}` JSON index. These are the regression targets for student distillation — the teacher never runs again after this step.
+Runs the frozen trained 3D model on every sample and saves the 256-D `complex_embed` vectors to `teacher_embeddings.npy` with a `{seq_id → row_index}` JSON index. These serve as structural latent targets for sequence surrogate training — the 3D model never runs again after this step.
 
-#### 2d. Train the student
+#### 2d. Train the sequence surrogate model
 
 ```bash
 python scripts/train.py
@@ -229,7 +229,7 @@ python scripts/train.py
 
 | Head | Output | Target | Loss | λ |
 |------|--------|--------|------|---|
-| Distillation | `[B, 256]` | `teacher_embeddings.npy` | Weighted MSE | 1.0 |
+| Geometric Alignment | `[B, 256]` | `teacher_embeddings.npy` | Weighted MSE | 1.0 |
 | Affinity Rank | `[B]` | SMINA Vinardo | Asymmetric ListMLE (fn_penalty=2.0) | 1.0 |
 | Boltz Reg. | `[B]` | `boltz_affinity_pred_value` | Weighted MSE | 0.5 |
 | Pose Quality | `[B, 1]` | `ligand_iptm > 0.75` | BCE | 0.1 |
@@ -314,7 +314,7 @@ The pipeline uses a clustered split (70/15/15) to prevent sequence leakage acros
 | Random CDR sequences | 3.59% | 17.98% | 16.63% |
 
 ### Model Benchmarks
-Evaluation on the held-out test set demonstrates that the Student model successfully distills the structural priors, maintaining strong ranking correlation (Spearman ρ) and early enrichment (EEF) while running orders of magnitude faster without requiring structural inputs.
+Evaluation on the held-out test set demonstrates that the sequence surrogate model successfully internalizes the structural priors, maintaining strong ranking correlation (Spearman ρ) and early enrichment (EEF) while running orders of magnitude faster without requiring structural inputs.
 
 | Model | Spearman ρ | EEF@5% |
 |-------|-----------|--------|
@@ -347,7 +347,7 @@ The trained Student model was used as a fast oracle to optimize a baseline binde
 
 ## Future Improvements
 
-While AbDistill provides a strong baseline for structural knowledge distillation, several areas could be improved in future iterations:
+While AbDistill provides a strong baseline for cross-modal geometric supervision and sequence surrogate modeling, several areas could be improved in future iterations:
 
 1. **Larger Dataset:** Expanding the dataset beyond the current size could improve both teacher and student generalization across more diverse CDR-H3 landscapes.
 2. **True Sequence Inputs for ESM-IF1:** ESM-IF1 is currently forced to run in a structure-only mode by passing a dummy poly-alanine sequence. Upgrading the pipeline to feed the true amino acid sequence to ESM-IF1 would allow the Teacher model to leverage both backbone geometry and residue-specific chemical environments.
