@@ -89,7 +89,7 @@ Boltz-2 output files parsed:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  DISTILLATION BRIDGE
+  GEOMETRIC SUPERVISION BRIDGE
   (precompute_teacher.py — teacher frozen, outputs pre-computed)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   teacher_embeddings.npy   [N_samples, 256]
@@ -145,7 +145,7 @@ Boltz-2 output files parsed:
     ┌───────────┬──────────────┬─────────────┬
     ▼           ▼              ▼             ▼
   Head 1      Head 2         Head 3        Head 4
-  Distill     Affinity Rank  Boltz Reg.    Pose Quality
+  LatentAlign Affinity Rank  Boltz Reg.    Pose Quality
   ─────────── ───────────── ────────────  ────────────
   Lin(256→256) Lin(256→64)  Lin(256→64)   Lin(256→64)
   LN(256)      LN(64)       LN(64)        LN(64)
@@ -158,7 +158,7 @@ Boltz-2 output files parsed:
       │  teacher_embeddings.npy   boltz_affinity BCE
       │  (per-sample lookup)      _pred_value    vs ligand_iptm
       ▼            ▼              ▼              > 0.75 threshold
-  distill_mse  asym_list_mle  boltz_mse     pose_quality_bce
+  latent_mse   asym_list_mle  boltz_mse     pose_quality_bce
   ×dist_weight ×rank_weight   ×dist_weight
   λ = 1.0      λ = 1.0        λ = 0.5       λ = 0.1
       │            │              │              │
